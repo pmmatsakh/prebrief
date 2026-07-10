@@ -1,0 +1,14 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Other people's data. network.yaml holds real names, employers and dates for
+# people who did not consent to being in a repo. Keep it local.
+network.yaml
+
+# profile.yaml is YOUR own data. Commit it if you want the connections
+# section to work on a deployed app; it asserts facts only about you.
+
+venv/
+__pycache__/
+*.pyc

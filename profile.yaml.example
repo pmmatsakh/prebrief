@@ -1,0 +1,11 @@
+# Who YOU are. Facts here are the ONLY facts the brief may assert about you.
+# No profile.yaml -> the connections section is omitted, never invented.
+name: Philip Matsakh
+schools:
+  - name: NYU
+    start: 2023
+    end: 2027
+    field: Economics
+employers: []
+cities:
+  - New York

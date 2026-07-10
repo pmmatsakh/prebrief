@@ -1,0 +1,11 @@
+# People you know, with their affiliations. Enables second-degree connection surfacing.
+# LinkedIn does not export second-degree connections and scraping violates its ToS;
+# this is co-employment inference from history you already know. Curate by hand.
+people:
+  - name: Emil Matsakh
+    relationship: father
+    employers:
+      - name: Accenture
+        start: 2009
+        end: 2014
+    cities: [New York]
