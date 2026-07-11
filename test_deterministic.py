@@ -631,8 +631,8 @@ def test_refine_queries_noop_without_a_descriptor():
 # --- org context: a shared entity, cached per company --------------------------
 
 def test_org_context_is_cached_per_company():
-    """The architectural claim, tested: Citigroup's context is identical for every
-    Citi contact. Second contact at the same firm costs zero searches, zero tokens."""
+    """Company context is identical for every contact at a firm. Second contact costs
+    zero searches, zero tokens. (Business unit is per-person; see below.)"""
     import orgcontext, llm as _llm, tools as _tools
     orgcontext._cache.clear()
     _real_search, _real_json = _tools.web_search, getattr(_llm, "call_json", None)
@@ -644,7 +644,7 @@ def test_org_context_is_cached_per_company():
     )
     _llm.call_json = lambda s, u: (
         calls.append(1) or '{"company":"Citi","industry":"Banking",'
-        '"company_situation":null,"business_unit":null,"caveats":[]}'
+        '"company_situation":null,"caveats":[]}'
     )
     orgcontext.tools, orgcontext.llm = _tools, _llm
 
@@ -671,16 +671,43 @@ def test_org_context_omits_unsupported_levels():
     assert "**Company**" not in md and "**Business unit**" not in md
 
 
+def test_business_unit_is_per_person_not_company_cached():
+    """The bug: business_unit was cached per company, so every Citi contact showed
+    the same unit. Irina is Commercial Bank; Bob is Wealth. They must differ."""
+    import orgcontext, llm as _llm
+    _llm.call_json = lambda s, u: '{"unit":"Nonprofit within Citi Commercial Bank","caveats":[]}'
+    ui, _ = orgcontext.resolve_unit(
+        [{"title": "Irina", "content": "Irina Berg leads Nonprofit at Citi Commercial Bank"}],
+        "Irina Berg", "Citi")
+    _llm.call_json = lambda s, u: '{"unit":"Citi Wealth","caveats":[]}'
+    ub, _ = orgcontext.resolve_unit(
+        [{"title": "Bob", "content": "Bob Smith advises in Citi Wealth"}],
+        "Bob Smith", "Citi")
+    assert ui.unit != ub.unit
+    assert "OrgContext" in dir(orgcontext) and not hasattr(
+        orgcontext.OrgContext(company="x"), "business_unit")
+
+
+def test_business_unit_not_guessed_without_sources():
+    import orgcontext
+    u, _ = orgcontext.resolve_unit([], "Someone", "Citi")
+    assert u.unit is None            # never inferred from the company name
+
+
 def test_org_context_renders_nothing_when_empty():
     import orgcontext
     assert orgcontext.render(orgcontext.OrgContext(company="Citi")) == ""
 
 
 def test_org_queries_are_company_level_only():
-    """Cacheable by construction: no query mentions the person."""
+    """Cacheable by construction: no query mentions the person. The sector query
+    deliberately omits the company name (it's about the industry), so the property
+    to assert is 'no person', not 'always company'."""
     import orgcontext
-    for q, _ in orgcontext.build_queries("Citi", unit="Commercial Bank"):
-        assert "Citi" in q
+    qs = orgcontext.build_queries("Citi", sector_hint="Commercial Bank")
+    joined = " | ".join(q for q, _ in qs)
+    assert "Citi" in joined                       # company appears in the set
+    assert all(len(q.split()) <= 6 for q, _ in qs)  # company/sector level, not person
 
 
 def test_affinity_tolerates_bare_string_yaml():
@@ -761,6 +788,14 @@ def test_org_context_never_renders_silence():
     ctx, audit = orgcontext.fetch("Citi")
     assert orgcontext.render(ctx).strip()
     assert any("no levels" in a for a in audit)
+
+
+def test_org_industry_is_sector_level_not_company():
+    import orgcontext
+    p = orgcontext.SYSTEM_PROMPT
+    assert "WHOLE sector" in p or "whole sector" in p.lower()
+    assert "company news" in p.lower()
+    assert "business_unit" not in p          # company prompt must not mention unit
 
 
 def test_required_key_is_not_enough_min_items_needed():
@@ -882,3 +917,267 @@ def test_no_candidate_background_leaves_notes_untouched():
                                     type=SignalType.PERSONAL, source_index=1)])
     b, _ = gate_facts(b, n_sources=1)
     assert len(b.personal_notes) == 1
+
+
+# --- question inversion: caught live in the Anthony demo -----------------------
+
+def test_candidate_directed_questions_are_detected():
+    """With a resume supplied, the model wrote questions AT the candidate ('you built
+    a demo app') instead of questions the user asks the subject. The prompt rule does
+    not reliably hold; this gate does."""
+    import llm as _llm
+    from schema import Question
+
+    def q(t):
+        return Question(question=t, why="w")
+
+    b = _brief(questions=[
+        q("You built a demo app and ran outreach to 50 colleges -- what did you learn?"),
+        q("Your team covers three nonprofit segments -- what's hardest to pick up?"),
+        q("You've fenced at a national level -- how does that translate?"),
+    ])
+    bad = _llm._inverted_questions(b)
+    assert bad == [0, 2]          # 'you built' and "you've fenced" flagged; 'your team' clean
+
+
+def test_subject_directed_questions_pass():
+    import llm as _llm
+    from schema import Question
+
+    def q(t):
+        return Question(question=t, why="w")
+
+    b = _brief(questions=[
+        q("Your team ships on bare-metal Linux -- what trips up new hires?"),
+        q("Disent covers three segments -- which is hardest to serve?"),
+        q("What does the demo need to prove in a first client meeting?"),
+    ])
+    assert _llm._inverted_questions(b) == []
+
+
+def test_inverted_brief_triggers_a_repair():
+    import llm as _llm
+    from schema import Inference, Question
+
+    def q(t):
+        return Question(question=t, why="w")
+
+    inverted = _brief(
+        observations=[Inference(claim="a", basis=[1]), Inference(claim="b", basis=[1])],
+        likely_priorities=[Inference(claim="c", basis=[1]), Inference(claim="d", basis=[1])],
+        questions=[q("You built a demo -- what did you learn?"),
+                   q("You ran outreach -- how did it go?"),
+                   q("Your fencing -- how does it translate?")],
+    )
+    fixed = inverted.model_copy(deep=True)
+    fixed.questions = [q("Your team ships on bare metal -- what trips up new hires?"),
+                       q("Disent covers three segments -- which is hardest?"),
+                       q("What must the demo prove in a first meeting?")]
+
+    calls = []
+    orig = _llm._call
+
+    def fake(messages, use_schema):
+        calls.append(use_schema)
+        return (inverted if len(calls) == 1 else fixed).model_dump_json()
+
+    _llm._call = fake
+    try:
+        out = _llm.synthesize_brief("sys", "usr", n_sources=5)
+    finally:
+        _llm._call = orig
+    assert _llm._inverted_questions(out) == []
+    assert len(calls) == 2
+
+
+# --- issue: self-authored posts must not be filtered out -----------------------
+
+def test_self_authored_posts_score_as_corroborated():
+    """A founder's own AI-philosophy posts name him but never the company, and were
+    dropped as uncorroborated. His own profile IS corroboration by authorship."""
+    post = {"url": "https://linkedin.com/posts/anthonymalizzio_ai-activity-1",
+            "title": "Anthony Malizzio on AI", "content": "Why AI safety is theater"}
+    assert pipeline.subject_match_strength(post, "Anthony Malizzio", "Disent") == 2
+
+
+def test_self_authored_detected_even_with_empty_body():
+    empty = {"url": "https://x.com/amalizzio/status/1", "title": "", "content": ""}
+    assert pipeline.subject_match_strength(empty, "Anthony Malizzio", "Disent") == 2
+
+
+def test_someone_elses_post_naming_the_subject_is_not_promoted():
+    other = {"url": "https://linkedin.com/posts/janedoe_ai-activity-9",
+             "title": "x", "content": "Anthony Malizzio is great"}
+    assert pipeline.subject_match_strength(other, "Anthony Malizzio", "Disent") == 1
+
+
+# --- issue: org-context hierarchy and scoping ----------------------------------
+
+def test_org_industry_query_targets_the_sector_not_the_company():
+    import orgcontext
+    qs = orgcontext.build_queries("Citi", sector_hint="nonprofit commercial bank")
+    joined = " | ".join(q for q, _ in qs)
+    assert "industry trends" in joined                       # sector-level query present
+    assert "nonprofit commercial bank industry" in joined
+
+
+def test_org_prompt_separates_industry_from_company():
+    import orgcontext
+    p = orgcontext.SYSTEM_PROMPT
+    assert "company news" in p.lower()        # industry must not hold company news
+    assert "business_unit" not in p           # unit is handled by a separate prompt
+    assert "ZERO company-specific" in p
+
+
+# --- keep the README architecture map honest ----------------------------------
+# These fail if the code and the README's module/gate tables drift apart, which is
+# the mechanism that keeps the map from going stale.
+
+def test_readme_lists_every_module():
+    import glob
+    import os
+    readme = open("README.md").read()
+    modules = [os.path.basename(f) for f in glob.glob("*.py")]
+    missing = [m for m in modules if m not in readme]
+    assert not missing, f"README architecture table is missing modules: {missing}"
+
+
+def test_readme_gate_functions_exist():
+    """Every gate the README names must be a real symbol in the code. Rename a gate
+    without updating the map and this fails."""
+    import importlib
+    readme = open("README.md").read()
+    checks = [
+        ("schema", "gate_facts"),
+        ("schema", "gate_role_sections"),
+        ("schema", "_overlaps_background"),
+        ("pipeline", "subject_match_strength"),
+        ("pipeline", "_is_self_authored"),
+        ("pipeline", "_is_roster"),
+        ("safety", "scan_protected"),
+        ("llm", "_missing_sections"),
+        ("llm", "_inverted_questions"),
+        ("orgcontext", "resolve_unit"),
+    ]
+    for mod_name, sym in checks:
+        assert sym in readme, f"README no longer documents gate `{sym}`"
+        mod = importlib.import_module(mod_name)
+        assert hasattr(mod, sym), f"README names `{sym}` but {mod_name}.py has no such symbol"
+
+
+def test_readme_test_count_is_current():
+    """The README cites a test count; keep it honest within a small margin."""
+    import re
+    readme = open("README.md").read()
+    cited = [int(n) for n in re.findall(r"(\d+)\s+(?:passed|tests)", readme)]
+    actual = sum(1 for line in open("test_deterministic.py") if line.lstrip().startswith("def test_"))
+    assert cited, "README should cite the test count"
+    assert any(abs(c - actual) <= 3 for c in cited), (
+        f"README cites {cited} tests but there are {actual}; update the README"
+    )
+
+
+def test_self_authored_matches_varied_linkedin_slugs():
+    """LinkedIn vanity URLs take many shapes for one person: full name, first-name,
+    initials, maiden name. Requiring the surname in the slug dropped real profiles
+    (and with them, academic history and personal passions)."""
+    for url in [
+        "https://linkedin.com/in/svetlana-matsakh",
+        "https://linkedin.com/in/svetlanam",       # first name + initial
+        "https://linkedin.com/in/smatsakh",        # initials
+        "https://linkedin.com/in/svetlana-berg",   # maiden name (given-name match)
+    ]:
+        src = {"url": url, "title": "", "content": ""}
+        assert pipeline.subject_match_strength(src, "Svetlana Matsakh", "") == 2, url
+
+
+def test_self_authored_opaque_slug_matches_on_body():
+    """A numeric/opaque slug still counts as self-authored if the page names them."""
+    src = {"url": "https://linkedin.com/in/xy12345", "title": "",
+           "content": "Svetlana Matsakh studied art history at NYU"}
+    assert pipeline.subject_match_strength(src, "Svetlana Matsakh", "") == 2
+
+
+def test_opaque_slug_without_name_is_not_self_attributed():
+    """Guard: an opaque slug whose body is about someone else must not be claimed."""
+    src = {"url": "https://linkedin.com/in/xy999", "title": "",
+           "content": "John Smith works in finance"}
+    assert pipeline.subject_match_strength(src, "Svetlana Matsakh", "") == 0
+
+
+def test_curated_roster_corroborates_identity_for_personal_facts():
+    """The Frick donation surfaced from a donor-list PDF, not her LinkedIn. A donor
+    list names her but has no company/role, so it was dropped as uncorroborated. A
+    curated roster IS corroboration -- an editor placed her specific name on it."""
+    frick = {"url": "https://frick.org/annual-report-donors.pdf",
+             "title": "The Frick Collection Annual Report - Donors",
+             "content": "The Frick Collection gratefully acknowledges its donors, "
+                        "including Svetlana Matsakh, for their generous support."}
+    assert pipeline.subject_match_strength(frick, "Svetlana Matsakh", "") == 2
+
+
+def test_roster_types_recognised():
+    for kind in ["Board of Trustees", "Alumni Directory", "2025 Members",
+                 "Gala Honorees", "list of benefactors"]:
+        src = {"url": "https://org.example/x", "title": kind,
+               "content": f"{kind}: Svetlana Matsakh."}
+        assert pipeline._is_roster(src, "Svetlana Matsakh"), kind
+
+
+def test_non_roster_mention_is_not_corroborated():
+    """A page that merely mentions her, with no roster signal and no company, stays
+    strength 1 -- we don't promote every name-drop to corroborated."""
+    src = {"url": "https://blog.example/post", "title": "Event recap",
+           "content": "Svetlana Matsakh attended the opening."}
+    assert pipeline.subject_match_strength(src, "Svetlana Matsakh", "") == 1
+
+
+def test_roster_not_naming_the_subject_is_not_corroborated():
+    src = {"url": "https://frick.org/donors.pdf", "title": "Frick Donors",
+           "content": "Donors: John Smith, Jane Doe, Robert Roe."}
+    assert pipeline.subject_match_strength(src, "Svetlana Matsakh", "") == 0
+
+
+# --- the worst failure: a fabricated brief on a wrong/misspelled name -----------
+
+def test_refuses_when_no_source_corroborates_the_person():
+    """A completely wrong name must NOT produce a confident brief. With zero
+    corroborated sources the pipeline refuses and says so, instead of inventing."""
+    import pipeline as pl
+    import tools as _tools
+    import llm as _llm
+
+    _tools.web_search = lambda q, topic="general", max_results=None, include_domains=None: [
+        {"url": "https://reuters.com/x", "title": "Unrelated",
+         "content": "A story about someone else entirely.", "date": None, "score": 0.3}]
+    _llm.screen_text = lambda t: "SAFE"
+    pl.tools, pl.llm = _tools, _llm
+
+    r = pl.generate_brief("Zxqw Nonexistent, Nowhere")
+    assert "Could not confirm" in r.brief.headline
+    assert any("REFUSED" in a for a in r.audit)
+    assert not r.brief.background and not r.brief.observations
+
+
+def test_misspelled_name_that_fuzzy_matches_is_flagged_in_the_brief():
+    """'Maulizzio' fuzzy-matches sources about 'Malizzio'. Correct for a typo, but the
+    brief must TELL the user it matched a different spelling -- in the caveats, not
+    just the audit log."""
+    import pipeline as pl
+    import tools as _tools
+    import llm as _llm
+    from schema import Brief, Fact, Question, SignalType
+
+    _tools.web_search = lambda q, topic="general", max_results=None, include_domains=None: [
+        {"url": "https://x.com/x", "title": "Anthony Malizzio",
+         "content": "Anthony Malizzio is CEO of Disent.", "date": None, "score": 0.7}]
+    _llm.screen_text = lambda t: "SAFE"
+    _llm.synthesize_brief = lambda s, u, n_sources=0: Brief(
+        person_name="Anthony Maulizzio", company="Disent", headline="CEO",
+        identity_confidence="high",
+        background=[Fact(text="CEO of Disent", type=SignalType.PROFESSIONAL, source_index=1)],
+        observations=[], likely_priorities=[], questions=[Question(question="q", why="w")] * 3)
+    pl.tools, pl.llm = _tools, _llm
+
+    r = pl.generate_brief("Anthony Maulizzio, Disent")
+    assert any("does not appear exactly" in c for c in r.brief.caveats)

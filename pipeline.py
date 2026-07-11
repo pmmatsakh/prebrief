@@ -272,6 +272,67 @@ def _name_present(haystack: str, full: str, tokens: list[str]) -> bool:
     return any(_close(given, w) for w in words)
 
 
+_SELF_AUTHORED = ("linkedin.com/posts", "linkedin.com/in", "x.com", "twitter.com",
+                  "youtube.com", "medium.com", "substack.com")
+
+# Curated rosters: donor lists, alumni directories, membership/board rolls, honorees.
+# An editor placing a specific name on such a list corroborates that the person is
+# ASSOCIATED with it -- which is exactly the personal/civic signal ("supports the
+# Frick Collection") that has no company/role to corroborate it and was being dropped
+# as uncorroborated. This is weaker than self-authorship: it corroborates the
+# membership fact and identity, not arbitrary claims lifted from the document.
+_ROSTER_TERMS = (
+    "donor", "donors", "benefactor", "patron", "supporters", "contributors",
+    "alumni", "alumnae", "directory", "members", "membership", "board of",
+    "trustees", "fellows", "honorees", "gala", "annual report", "giving",
+)
+
+
+def _is_roster(source: dict, name: str) -> bool:
+    """A curated list that includes the person by name. Corroborates membership and
+    identity for personal/civic facts, without treating the whole document as theirs."""
+    text = f"{source.get('title','')} {source.get('content','')}".lower()
+    tokens = [t for t in name.lower().split() if len(t) > 2]
+    if not tokens:
+        return False
+    if not _name_present(text, name.lower(), tokens):
+        return False
+    return any(term in text for term in _ROSTER_TERMS)
+
+
+def _is_self_authored(url: str, name: str, haystack: str = "") -> bool:
+    """A page on the subject's OWN profile is them, whether or not it names the
+    company. A founder's AI-philosophy posts never say the company name but are
+    prime brief material -- and were being dropped as 'uncorroborated'.
+
+    Matching is deliberately generous on the slug, because LinkedIn vanity URLs take
+    many shapes for the same person: full name, first-name-only, initials, or a
+    maiden name (`svetlanam`, `smatsakh`, `svetlana-berg`). We accept the profile if
+    the slug contains the surname OR the given name, or if the page body itself names
+    the person. Over-matching a self-authored domain is low-risk; dropping the
+    subject's own profile is not.
+    """
+    u = (url or "").lower()
+    if not any(d in u for d in _SELF_AUTHORED):
+        return False
+    tokens = [t for t in name.lower().split() if len(t) > 2]
+    if not tokens:
+        return False
+    slug = u.replace("-", "").replace("_", "")
+    given, surname = tokens[0], tokens[-1]
+    if surname in slug or given in slug:
+        return True
+    # Body-match fallback ONLY for a genuinely opaque slug (a numeric/random handle
+    # that names nobody). If the slug names a DIFFERENT person -- e.g. /in/janedoe or
+    # /posts/janedoe -- this is their page mentioning the subject, not the subject's
+    # own page, so we do not claim it.
+    handle = u.split("/in/")[-1].split("/posts/")[-1].split("/")[0]
+    handle_alpha = re.sub(r"[^a-z]", "", handle)
+    if len(handle_alpha) >= 4:          # slug contains a real name, and it isn't ours
+        return False
+    return bool(haystack) and _name_present(haystack, name.lower(), tokens)
+
+
 def subject_match_strength(
     source: dict, name: str, company: str = "", role_phrase: str = ""
 ) -> int:
@@ -279,11 +340,11 @@ def subject_match_strength(
 
         0 = does not name them at all
         1 = names them, nothing corroborates identity
-        2 = names them AND mentions the company or their role phrase
+        2 = names them AND (mentions company/role OR is on their own profile)
 
-    Strength 1 is where entity collision lives. A source about "Irina Berg" who
-    organised Cologne Model United Nations in 2019 passes a surname check and is
-    about a different human entirely. Corroboration is what separates them.
+    Strength 1 is where entity collision lives -- a different person sharing a name.
+    A page on the subject's own social profile is corroboration by authorship, so it
+    scores 2 even with no company mention.
     """
     if not name:
         return 2
@@ -294,8 +355,20 @@ def subject_match_strength(
 
     full = name.lower()
     surname = tokens[-1]
+    self_authored = _is_self_authored(source.get("url", ""), name, haystack)
+
     if not _name_present(haystack, full, tokens):
-        return 0
+        # Self-authored pages often extract to an empty body; the URL is enough.
+        return 2 if self_authored else 0
+
+    if self_authored:
+        return 2
+
+    # A curated roster (donor list, alumni directory, membership roll) that names them
+    # corroborates identity for personal/civic facts, which otherwise have no company
+    # or role to corroborate against.
+    if _is_roster(source, name):
+        return 2
 
     corroborators = [c.lower() for c in (company, role_phrase) if c]
     # Individual words of the role phrase count too: "nonprofit", "banking".
@@ -493,6 +566,52 @@ def generate_brief(
             "names will collide. Use 'Name, Company'."
         )
 
+    # 4a. Spelling check: does the name the user typed actually appear in the sources,
+    #     or only a fuzzy variant? Fuzzy matching lets 'Maulizzio' attach to sources
+    #     about 'Malizzio' -- correct for a typo, but the brief is then about a
+    #     DIFFERENTLY SPELLED person and the user must be told.
+    exact_name_hits = sum(
+        1 for s in sources
+        if name.lower() in f"{s.get('title','')} {s.get('content','')}".lower()
+    )
+    spelling_warning = None
+    if sources and name and exact_name_hits == 0:
+        spelling_warning = (
+            f"The name '{name}' does not appear exactly in any source; this brief was "
+            "matched on a close spelling. Verify the name — it may describe a "
+            "differently-spelled person."
+        )
+        audit.append("WARNING: " + spelling_warning)
+
+    # 4b. Refusal floor. If almost nothing corroborates this specific person, do NOT
+    #     synthesize -- a thin/uncertain pool is exactly what the model fabricates
+    #     around. Return an honest 'could not confirm' brief instead.
+    corroborated = sum(1 for s in sources if s.get("_match", 0) >= 2)
+    if corroborated == 0:
+        audit.append(
+            f"REFUSED: no source corroborates '{name}'"
+            + (f" at {company}" if company else "")
+            + ". Returning an honest 'not found' brief rather than inventing one."
+        )
+        brief = Brief(
+            person_name=name or "unknown",
+            company=company or "",
+            headline="Could not confirm this person from available sources.",
+            identity_confidence="low",
+            caveats=[
+                f"Search did not return sources that confirm {name}"
+                + (f" at {company}" if company else "")
+                + ". This may be a spelling variation, a person with little public "
+                "footprint, or an entity not legible to web search. Nothing below is "
+                "asserted; supply known details via 'what you already know' to proceed.",
+            ],
+        )
+        markdown = render_markdown(brief, sources, [])
+        return PipelineResult(
+            brief=brief, markdown=markdown, sources=sources,
+            connections=[], queries=[q for q, _ in plan], audit=audit,
+        )
+
     # 5. Synthesize -- the ONLY LLM step
     on_step(f"Synthesizing with {config.LLM_MODEL}")
 
@@ -520,6 +639,8 @@ def generate_brief(
 
     brief = llm.synthesize_brief(system_prompt, user_prompt, n_sources=len(sources))
     brief.identity_confidence = confidence  # trust retrieval, not the model's self-report
+    if spelling_warning:
+        brief.caveats.insert(0, spelling_warning)
 
     # 6. Output gates
     brief, actions = gate_facts(
@@ -558,9 +679,15 @@ def generate_brief(
                 "use 'Name, Company'"
             )
         else:
-            org, org_audit = orgcontext.fetch(company, unit=subject_hints, on_step=on_step)
+            # Company context: SHARED, cached per company (industry + company only).
+            org, org_audit = orgcontext.fetch(
+                company, sector_hint=subject_hints, on_step=on_step
+            )
             audit += org_audit
-            block = orgcontext.render(org)
+            # Business unit: PER-PERSON, from this subject's own sources, never cached.
+            unit, unit_audit = orgcontext.resolve_unit(sources, name, company, on_step=on_step)
+            audit += unit_audit
+            block = orgcontext.render(org, unit)
             if block:
                 markdown = (
                     markdown.replace("## Sources", block + "\n## Sources", 1)

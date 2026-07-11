@@ -4,6 +4,7 @@ Retries with exponential backoff: Groq WILL rate-limit and the app should not di
 """
 
 import json
+import re
 import random
 import time
 
@@ -205,6 +206,26 @@ def screen_text(text: str) -> str:
     raise SynthesisError(f"ambiguous screening verdict: {verdict!r}")
 
 
+_INVERTED_Q = re.compile(
+    r"\b(you built|you ran|you led|you created|you developed|you organized|"
+    r"you've (built|run|led|fenced|worked|created)|your (resume|résumé|background|"
+    r"experience|internship|project|demo|outreach|athletic|competitive|fencing))\b",
+    re.I,
+)
+
+
+def _inverted_questions(brief: Brief) -> list[int]:
+    """Questions are asked BY the user TO the subject. A question phrased at the
+    candidate's own history ('you built a demo app...') is backwards -- that's the
+    interviewer's question, not the user's. The prompt rule does not reliably hold
+    when a resume is supplied, so this is enforced here."""
+    bad = []
+    for i, q in enumerate(brief.questions):
+        if _INVERTED_Q.search(q.question or ""):
+            bad.append(i)
+    return bad
+
+
 def _missing_sections(brief: Brief, n_sources: int) -> list[str]:
     """Groq does not enforce `minItems`. A brief whose synthesis sections came back
     empty validated fine and shipped with no observations in it -- twice."""
@@ -266,6 +287,32 @@ def synthesize_brief(system_prompt: str, user_prompt: str, n_sources: int = 0) -
             raw = _call(messages, use_schema=False)
 
     assert brief is not None
+    inverted = _inverted_questions(brief)
+    if inverted:
+        messages += [
+            {"role": "assistant", "content": raw},
+            {
+                "role": "user",
+                "content": (
+                    f"{len(inverted)} of your questions are addressed to the CANDIDATE "
+                    "('you built...', 'your resume...'). That is backwards. The questions "
+                    "are asked BY the reader TO the subject, about the SUBJECT's own work "
+                    "and world.\n"
+                    "WRONG: 'You ran outreach to 50 colleges -- what did you learn?'\n"
+                    "RIGHT: 'Your team covers three nonprofit segments -- what's hardest "
+                    "for a new hire to pick up?'\n"
+                    "Rewrite ALL three questions so each is answerable by the subject "
+                    "about their own role. Return the complete corrected JSON."
+                ),
+            },
+        ]
+        try:
+            fixed = Brief.model_validate(json.loads(_call(messages, use_schema=False)))
+            if not _inverted_questions(fixed):
+                brief = fixed
+        except (json.JSONDecodeError, ValidationError):
+            pass
+
     missing = _missing_sections(brief, n_sources)
     if missing:
         messages += [
